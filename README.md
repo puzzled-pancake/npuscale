@@ -174,5 +174,13 @@ The NPU runtime is Qualcomm QAIRT SDK material under its license. Qualcomm
 and Hexagon are trademarks of Qualcomm. The runtime files are not
 distributed here.
 
+## Supporters
+
+A standing thank you to the people who fund this work:
+
+- [54pkp](https://github.com/54pkp) — the project's first supporter, at
+  the top $25 a month tier.
+
 If this makes your handheld better, you can
-[sponsor development](https://github.com/sponsors/puzzled-pancake).
+[sponsor development](https://github.com/sponsors/puzzled-pancake) and
+your name goes here too.

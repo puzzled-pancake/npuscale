@@ -1,0 +1,428 @@
+#version 450
+// W-V1: Vulkan-compute port of phase2gpu/features_fused.comp (R21/R26/R33
+// production fused feat+pre0) onto the W-V0 layer chassis. Body VERBATIM
+// except the GLES->Vulkan mechanics (see RUNBOOK R26f):
+//   - uniforms (u_jitter/u_reset/u_expo/u_bftau/IN_W/IN_H/LR_W/LR_H) ->
+//     push constants (std430, 36 bytes)
+//   - u_rec sampler2D (unit 1) -> SSBO binding 3 + manual bilinear at the
+//     SAME texel coords: texture(u_rec, (h+0.5)/size) samples at (h) in
+//     texel space, so recBilinear(hx, hy) is the identical sample point
+//     (on-screen; off-screen is gated before the fetch either way)
+//   - mediump d/w in upscaled_current computed in fp32 (Adreno GLES rounded
+//     these to fp16; both the port and the numpy golden use fp32 — the
+//     GLES bank comparison is tolerance-class by the R33e law regardless)
+//   - binding 15 disto kept bound; write still gated by u_bftau (0 here)
+// Bindings (unchanged numbers from the GLES original): 1=pre_out, 2=weights,
+// 3=rec_prev (NEW, was sampler), 5=rawlr, 9=rpj out, 10=hist in, 12=mvec in,
+// 15=compact dist out, 16=dpt in (D32 words; AMD dilate_mv port 2026-10-11).
+// WEIGHT-ORDER CONTRACT inherited from pre0_final.comp: c10=(x+1,y+0) pairs
+// with w2(f,ky=1,kx=0) and c01=(x+0,y+1) with w2(f,ky=0,kx=1) — TRANSPOSED
+// vs gen_gpu_data.py's docs; the deployed pass0_wb.raw (md5 0915f25d...) is
+// in the compensating order. Do NOT regenerate the .raw without reconciling.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 1) writeonly buffer OutQ { uint outq[]; };
+layout(std430, binding = 2) readonly buffer Weights { uint wb[]; };  // 256 weight words then 8 bias words
+layout(std430, binding = 9) writeonly buffer Repj { uint rpj[]; };   // fp16 RGBA @1080p
+layout(std430, binding = 10) readonly buffer Hist { uint hst[]; };   // fp16 RGBA mu-law @1080p
+layout(std430, binding = 12) readonly buffer Mvec { uint mvec[]; };
+layout(std430, binding = 5) readonly buffer RawLr { uint rawlr[]; };  // raw R11G11B10F (1 word/texel)
+// binding 3 = the recurrent image. THE LOOP CONTRACT (r26k): production rec
+// is RGBA8 end-to-end — postA stores floor(rec*255+0.5) bytes (wv2a line
+// "SDK recurrent is RGBA8"), and the GLES u_rec sampler unorm-decoded the
+// same texture to k/255. Compile with -DREC_U8 for the LOOP shape (1 u32
+// word/px, RGBA8 bytes, decode byte/255.0 — bit-identical to the sampler's
+// unorm fetch). The default (no define) keeps the W-V1 validation shape:
+// the fp16 RGBA bank the r26f capture banked (2 words/px) — do NOT repoint
+// W-V1 at the u8 shape without re-running its golden.
+#ifdef REC_U8
+layout(std430, binding = 3) readonly buffer RecPrev { uint recp[]; }; // u8 RGBA words @1080p (loop)
+#else
+layout(std430, binding = 3) readonly buffer RecPrev { uint recp[]; }; // fp16 RGBA @1080p (was u_rec)
+#endif
+layout(std430, binding = 15) buffer DistO { uint disto[]; };// compact dist + disoc bit
+// (bftau-gated; READ-WRITE since the hysteresis port: wv1 ORs the previous
+// frame's fire bit so the detector band stays STABLE instead of flickering
+// at silhouette texels — the "edge crawl" fix, rev3c.12)
+layout(std430, binding = 16) readonly buffer Dpt { uint dpt[]; };    // D32 words @input res
+// (XeSS INVERTED_DEPTH flag 0x102: larger word = closer surface)
+layout(std430, binding = 17) readonly buffer DptPrev { uint dptp[]; };// prev frame's D32 (disoc)
+
+layout(push_constant) uniform PC {
+    vec2 u_jitter;   // +0
+    float u_reset;   // +8
+    float u_expo;    // +12
+    float u_bftau;   // +16
+    uint IN_W;       // +20
+    uint IN_H;       // +24
+    uint LR_W;       // +28  GAME render width (GW). Ratio era: the game-LR
+    uint LR_H;       // +32  extents per frame; the MODEL grid is the consts
+                     //      below (bit-identical to the old fixed 640x360
+                     //      pushes at the Performance preset where GW=640)
+    float u_dilate;  // +36: AMD dilate_mv — velocity sampled at the
+                     // closest-depth texel instead of the center (0 = legacy
+                     // center read, bit-identical; the layer patches this
+                     // word live from the DILATE knob)
+    float u_rcps;    // +40: 1/NPU-input-quant-scale for the ACTIVE tier
+                     //      (native 68.4529 / quality 66.65824 / balanced
+                     //      80.1590 / perf 67.5153 / ultraperf 83.6748) —
+                     //      was the compile-time RCP_S const
+} pc;
+
+/* the MODEL grid (NPU tensor extents) — fixed per the AMD architecture: the
+ * model ALWAYS runs at HR/2 -> HR; only the weights (tier) and the game-LR
+ * pre-sampling (LR_W/LR_H pushes) change with the XeSS preset */
+const uint MODEL_W = 640u, MODEL_H = 360u;
+
+vec3 loadHistRaw(uint x, uint y) {
+    uint base = (y * pc.IN_W + x) * 2u;
+    return vec3(unpackHalf2x16(hst[base]), unpackHalf2x16(hst[base + 1u]).x);
+}
+// inline f11 decode + expo + mu-law (bit-exact incl. subnormals/inf; the
+// result is ROUND-TRIPPED through packHalf2x16 because SSBO13 stored fp16)
+vec3 muled_raw(uint t) {
+    vec3 c = vec3(unpackHalf2x16((t & 0x7FFu) << 4u).x,
+                  unpackHalf2x16(((t >> 11) & 0x7FFu) << 4u).x,
+                  unpackHalf2x16(((t >> 22) & 0x3FFu) << 5u).x) * pc.u_expo;
+    vec3 m = max(vec3(0.1174) * log(1.0 + 150.0 * c), vec3(0.0));
+    vec2 xy = unpackHalf2x16(packHalf2x16(m.xy));
+    float z = unpackHalf2x16(packHalf2x16(vec2(m.z, 0.0))).x;
+    return vec3(xy, z);
+}
+vec3 loadMulr(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(int(pc.LR_W) - 1, int(pc.LR_H) - 1));
+    return muled_raw(rawlr[uint(p.y) * pc.LR_W + uint(p.x)]);
+}
+float depthAt(ivec2 q) {
+    q = clamp(q, ivec2(0), ivec2(int(pc.LR_W) - 1, int(pc.LR_H) - 1));
+    return uintBitsToFloat(dpt[uint(q.y) * pc.LR_W + uint(q.x)]);
+}
+float depthPrevAt(ivec2 q) {
+    q = clamp(q, ivec2(0), ivec2(int(pc.LR_W) - 1, int(pc.LR_H) - 1));
+    return uintBitsToFloat(dptp[uint(q.y) * pc.LR_W + uint(q.x)]);
+}
+// NMS-PORT 2026-10-10: the game's XeSS velocity texture is LOW-RES MOTION IN
+// PIXELS (init flags 0x102: HIGH_RES_MV and USE_NDC_VELOCITY both unset;
+// JITTERED_MV unset = jitter excluded). The pipeline's mvec contract is
+// NORMALIZED (hx = x + vel*IN_W). Pixel MVs fed verbatim reprojected ~600px
+// per px of motion — every gather offscreen, the "blend ceiling" shimmer.
+vec2 normVel(ivec2 q) {
+    q = clamp(q, ivec2(0), ivec2(int(pc.LR_W) - 1, int(pc.LR_H) - 1));
+    return unpackHalf2x16(mvec[uint(q.y) * pc.LR_W + uint(q.x)])
+         * vec2(1.0 / float(pc.LR_W), 1.0 / float(pc.LR_H));
+}
+// AMD local_disocclusion_user (a stub in FSR4 4.0.2 — invalid-MV guard
+// only, no depth test). AMD checks the raw mv_scale'd vector; ours is the
+// normalized one — same rejection class for any real motion (<1) vs junk.
+bool velOk(vec2 v) {
+    return !isnan(v.x) && !isnan(v.y) && !isinf(v.x) && !isinf(v.y)
+        && abs(v.x) < 1e6 && abs(v.y) < 1e6;
+}
+// AMD dilate_mv (mlsr_optimized_includes.hlsli; FFX_MLSR_LOW_RES_MV +
+// FFX_MLSR_DEPTH_INVERTED = our XeSS flags 0x102). Their per-output-texel
+// 3x3 OUTPUT-space neighborhood maps through round(tid*0.5 - 0.25) onto a
+// 2x2 INPUT-space block per output pixel; the closest surface (inverted
+// depth: max) wins and the MV loads at that texel. Tie order (scan-first
+// vs AMD's center-first) diverges only on exact fp32 depth ties.
+// RATIO ERA: o arrives in MODEL coords; depth/mvec live at GAME-LR strides
+// (LR_W/LR_H) — map model->IN->game via *(2*inv) (identity at ratio 2.0).
+ivec2 dilate2(ivec2 o) {
+    vec2 inv = vec2(pc.LR_W, pc.LR_H) / vec2(pc.IN_W, pc.IN_H);
+    ivec2 g = ivec2(vec2(o) * (2.0 * inv));
+    ivec2 best = g;
+    float bd = depthAt(g);
+    for (int dy = 0; dy < 2; ++dy)
+        for (int dx = 0; dx < 2; ++dx) {
+            ivec2 q = g + ivec2(dx, dy);
+            float d = depthAt(q);
+            if (d > bd) { bd = d; best = q; }
+        }
+    return best;
+}
+float catmull(float f, uint k) {
+    if (k == 0u) return f * (-0.5 + f * (1.0 - 0.5 * f));
+    if (k == 1u) return 1.0 + f * f * (-2.5 + 1.5 * f);
+    if (k == 2u) return f * (0.5 + f * (2.0 - 1.5 * f));
+    return f * f * (-0.5 + 0.5 * f);
+}
+vec4 upscaled_current(uvec2 tid) {
+    /* AMD optimized_input_upscale_user, generalized: inv_scale =
+     * game-LR per IN pixel (their invInputSize), scale = its reciprocal
+     * (their scale.xy — the FilterWeightGaussian arg). At the Performance
+     * preset inv=(0.5,0.5): pos_f = -0.25 + tid*0.5 + jitter and d*2.0 —
+     * bit-identical to the fixed-ratio port. */
+    vec2 inv = vec2(pc.LR_W, pc.LR_H) / vec2(pc.IN_W, pc.IN_H);
+    vec2 scl = vec2(1.0) / inv;
+    vec2 pos_f = (vec2(-0.5) + inv * 0.5) + vec2(tid) * inv + pc.u_jitter;
+    ivec2 pos_i = ivec2(floor(pos_f));
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    float wmax = 0.0;
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            ivec2 pi = pos_i + ivec2(dx, dy);
+            vec2 d = (vec2(pi) - pos_f) * scl;
+            float w = exp2((dot(d, d) * (-0.5 / (0.47 * 0.47))) * 1.4426950409);
+            ivec2 p = clamp(pi, ivec2(0), ivec2(int(pc.LR_W) - 1, int(pc.LR_H) - 1));
+            vec3 c = loadMulr(p);
+            acc += c * w;
+            wsum += w;
+            wmax = max(wmax, w);
+        }
+    }
+    return vec4(acc / wsum, wmax);
+}
+void gather_prep(float hx, float hy, out float wx[4], out float wy[4]) {
+    float sx = hx + 0.5; float sy = hy + 0.5;
+    float tx0 = floor(sx - 0.5); float ty0 = floor(sy - 0.5);
+    float fx = sx - (tx0 + 0.5); float fy = sy - (ty0 + 0.5);
+    for (int j = 0; j < 4; ++j) wx[j] = catmull(fx, uint(j));
+    for (int k = 0; k < 4; ++k) wy[k] = catmull(fy, uint(k));
+}
+vec4 recAt(ivec2 p) {
+#ifdef REC_U8
+    // loop contract: one u32 word = RGBA8 bytes. The DECODE byte/255.0 is
+    // bit-identical to the GLES sampler's unorm fetch (same single
+    // correctly-rounded fp32 division); the FILTERED result is tolerance-
+    // class (GLES permits reduced-precision LINEAR weights — R33e law), as
+    // the W-V4 gates encode (RT1: decode exact, filter tolerance-class)
+    uint w = recp[uint(p.y) * pc.IN_W + uint(p.x)];
+    return vec4(float(w & 0xffu), float((w >> 8u) & 0xffu),
+                float((w >> 16u) & 0xffu), float(w >> 24u)) / 255.0;
+#else
+    uint base = (uint(p.y) * pc.IN_W + uint(p.x)) * 2u;
+    return vec4(unpackHalf2x16(recp[base]), unpackHalf2x16(recp[base + 1u]));
+#endif
+}
+vec4 recBilinear(float hx, float hy) {
+    float rx = clamp(hx, 0.0, float(pc.IN_W - 1u));
+    float ry = clamp(hy, 0.0, float(pc.IN_H - 1u));
+    int x0 = int(floor(rx)); int y0 = int(floor(ry));
+    float fx = rx - float(x0); float fy = ry - float(y0);
+    int x1 = min(x0 + 1, int(pc.IN_W) - 1);
+    int y1 = min(y0 + 1, int(pc.IN_H) - 1);
+    vec4 c00 = recAt(ivec2(x0, y0)); vec4 c10 = recAt(ivec2(x1, y0));
+    vec4 c01 = recAt(ivec2(x0, y1)); vec4 c11 = recAt(ivec2(x1, y1));
+    vec4 top = c00 * (1.0 - fx) + c10 * fx;
+    vec4 bot = c01 * (1.0 - fx) + c11 * fx;
+    return top * (1.0 - fy) + bot * fy;
+}
+void feat_px(uvec2 tid, vec2 vel, bool mv_ok, bool onscreen, vec3 history,
+             out uint o0, out uint o1, out uint o2, out uint o3) {
+    vec4 upsc = upscaled_current(tid);
+    vec3 cur = upsc.rgb;
+    float center_w = upsc.a;
+
+    float hx = float(tid.x) + vel.x * float(pc.IN_W);
+    float hy = float(tid.y) + vel.y * float(pc.IN_H);
+
+    vec4 rec = vec4(0.0);
+    /* geometric disocclusion, done RIGHT (rev3c.9): PREVIOUS frame's depth
+     * at the reprojected position vs CURRENT depth at the pixel (the
+     * FSR2-class test). Photometric detectors failed this scene both ways
+     * (dark frame on dark space invisible; bright shimmer false-fires).
+     * Same-frame-depth-at-reproj was also wrong (sampled what is near the
+     * pixel NOW — fired in wide bands around every depth edge in motion,
+     * the "horrific" build). Prev-vs-current is tight: exposed pixel =
+     * far now, its previous position held the near occluder -> fires;
+     * same surface -> prev==curr -> holds. Inverted depth: larger =
+     * closer. AMD's pre_wmma writes history=0 + recurrent=0 on
+     * disocclusion — same signature here. */
+    /* ratio era: tid is IN-space; the depth banks are game-LR — map by
+     * inv_scale (the old >>1 / *0.5 forms are the ratio-2.0 instances of
+     * exactly this truncation, positive coords) */
+    vec2 invd = vec2(pc.LR_W, pc.LR_H) / vec2(pc.IN_W, pc.IN_H);
+    float dpx  = depthAt(ivec2(vec2(tid) * invd));
+    float drep = depthPrevAt(ivec2(vec2(hx, hy) * invd));
+    bool disoc_fresh = mv_ok && onscreen && (drep > dpx * 5.0) && (drep - dpx > 0.01);
+    /* hysteresis: a fired pixel stays fired while the previous frame's bit
+     * is set (the band holds ~as long as the exposure lasts; the depth
+     * texel straddling both surfaces at a silhouette made the bare test
+     * flicker per-frame = the crawl). The disto word is written ONLY under
+     * u_bftau>0 (same gate as ever); the read below races nothing — the
+     * previous frame's write completed (queue order). */
+    float hold = 0.0;   /* the previous countdown: 1.0 = fired this frame,
+                         * decaying 0.25/frame — >0.5 counts as fired (the
+                         * fresh frame + a 2-frame hold), then expires */
+    { uint dprev = disto[tid.y * pc.IN_W + tid.x];
+      hold = unpackHalf2x16(dprev).y; }
+    bool disoc = disoc_fresh || hold > 0.5;
+    float hold_next = disoc_fresh ? 1.0 : max(hold - 0.25, 0.0);
+    if (pc.u_reset > 0.5) {
+        history = cur;
+    } else if (onscreen && !disoc) {
+        rec = recBilinear(hx, hy);
+    }
+
+    float tsw = 0.1 * center_w;
+    /* rev3c.14 RESET-SIGNATURE disocclusion: a detected pixel's history is
+     * REPLACED by the current frame (AMD's reset semantic — "the model is
+     * trained to the current frame as both input and history", pre_wmma
+     * :152-154) instead of zeroed. Nothing downstream changes: rect != 0 so
+     * wv2a's black-guard does NOT drop the floor (the edge-AA survives),
+     * no blend clamp, no kernel override — the loop just re-accumulates on
+     * CORRECT content instead of smearing the old. The rect=0 form remains
+     * ONLY for invalid MVs (AMD's own disocclusion stub). */
+    vec3 rect = (pc.u_reset > 0.5 || disoc) ? cur
+              : (mv_ok ? (tsw * cur + (1.0 - tsw) * history) : vec3(0.0));
+
+    float yin = cur.r * 0.2126 + cur.g * 0.7152 + cur.b * 0.0722;
+    float yh  = rect.r * 0.2126 + rect.g * 0.7152 + rect.b * 0.0722;
+    float cb_in = (cur.b - yin) / 1.8556; float cr_in = (cur.r - yin) / 1.5748;
+    float cb_h  = (rect.b - yh) / 1.8556; float cr_h  = (rect.r - yh) / 1.5748;
+    float dist = sqrt((cb_in - cb_h) * (cb_in - cb_h) + (cr_in - cr_h) * (cr_in - cr_h) + 1e-6);
+
+    /* the floor's decay input is NOT the model feature above. AMD's model
+     * sees the LUMA pair (n0,n1) and rebuilds at dark disocclusions where
+     * chroma dist is ~0 (dark ship frame vs dark space — the space-pan
+     * ghost, 2026-10-11; the chroma-only decay went blind there and the
+     * floor overrode the model's own rebuild). The disto bank feeds ONLY
+     * wv2a's bfloor decay, so give it luma with a DEADBAND: specular
+     * shimmer is temporal luma flicker UNDER the deadband (floor holds —
+     * the shimmer fix), disocclusion clears it (floor decays — the ghost
+     * fix). The feature o1 keeps AMD's exact chroma-only dist. */
+    float dyL = max(abs(yin - yh) - 0.06, 0.0);
+    float distD = sqrt(dyL * dyL + (cb_in - cb_h) * (cb_in - cb_h) + (cr_in - cr_h) * (cr_in - cr_h) + 1e-6);
+
+    float n0 = 2.0 * yin - 1.0;
+    float n1 = 2.0 * yh - 1.0;
+    vec4 rn = 2.0 * rec - 1.0;
+
+    o0 = packHalf2x16(vec2(n0, n1));
+    o1 = packHalf2x16(vec2(dist, rn.x));
+    o2 = packHalf2x16(vec2(rn.y, rn.z));
+    o3 = packHalf2x16(vec2(rn.w, 0.0));
+
+    uint rbase = (tid.y * pc.IN_W + tid.x) * 2u;
+    rpj[rbase]     = packHalf2x16(rect.xy);
+    rpj[rbase + 1u] = packHalf2x16(vec2(rect.z, 1.0));
+
+    if (pc.u_bftau > 0.0)
+        disto[tid.y * pc.IN_W + tid.x] = packHalf2x16(vec2(distD, hold_next));
+}
+vec2 w2(uint f, uint ky, uint kx, uint c2) {
+    return unpackHalf2x16(wb[f * 16u + (ky * 2u + kx) * 4u + c2]);
+}
+float biasAt(uint f) {
+    vec2 v = unpackHalf2x16(wb[256u + (f >> 1u)]);
+    return (f & 1u) == 0u ? v.x : v.y;
+}
+uint pack4(int b0, int b1, int b2, int b3) {
+    return (uint(b0) & 0xffu)
+         | ((uint(b1) & 0xffu) << 8u)
+         | ((uint(b2) & 0xffu) << 16u)
+         | ((uint(b3) & 0xffu) << 24u);
+}
+/* RCP_S retired to a push word (u_rcps): per-tier 1/input-quant-scale —
+ * native 68.45285 / quality 66.65824 (the validated authored literal) /
+ * balanced 80.15899 / perf 67.51529 / ultraperf 83.67478 */
+int quant1(float acc, float bias) {
+    float v = (acc + bias) * pc.u_rcps;
+    return int(clamp(roundEven(v), -128.0, 127.0));
+}
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    /* MODEL bounds + MODEL-stride outq: the dispatch and the NPU tensor are
+     * the FIXED 640x360 grid for every preset (LR_W/LR_H may be larger OR
+     * smaller than the model grid — never gate or stride the tensor by them) */
+    if (p.x >= MODEL_W || p.y >= MODEL_H) return;
+
+    uint x0 = 2u * p.x, x1 = 2u * p.x + 1u;
+    uint y0 = 2u * p.y, y1 = 2u * p.y + 1u;
+
+    /* per-pixel velocities: legacy (u_dilate=0) reads the quad's own input
+     * texel for all four outputs (the pre-port behavior); dilate picks the
+     * closest-depth texel of each output pixel's 2x2 input block (AMD
+     * dilate_mv) — foreground motion wins at silhouettes. AMD's blocks for
+     * our quad at p: A=(x0,y0)->origin(p-1,p-1)  B=(x1,y0)->(p,py-1)
+     * C=(x0,y1)->(px-1,py)  D=(x1,y1)->(p). */
+    vec2 vel0 = normVel(ivec2(p));
+    vec2 vA = vel0, vB = vel0, vC = vel0, vD = vel0;
+    if (pc.u_dilate > 0.5) {
+        ivec2 c = ivec2(p);
+        vA = normVel(dilate2(c + ivec2(-1, -1)));
+        vB = normVel(dilate2(c + ivec2( 0, -1)));
+        vC = normVel(dilate2(c + ivec2(-1,  0)));
+        vD = normVel(dilate2(c + ivec2( 0,  0)));
+    }
+    bool okA = velOk(vA), okB = velOk(vB), okC = velOk(vC), okD = velOk(vD);
+
+    vec3 histA = vec3(0.0), histB = vec3(0.0), histC = vec3(0.0), histD = vec3(0.0);
+    bool onsA = false, onsB = false, onsC = false, onsD = false;
+    if (pc.u_reset <= 0.5 && (okA || okB || okC || okD)) {
+        float hxA = float(x0) + vA.x * float(pc.IN_W);
+        float hyA = float(y0) + vA.y * float(pc.IN_H);
+        float hxB = float(x1) + vB.x * float(pc.IN_W);
+        float hyB = float(y0) + vB.y * float(pc.IN_H);
+        float hxC = float(x0) + vC.x * float(pc.IN_W);
+        float hyC = float(y1) + vC.y * float(pc.IN_H);
+        float hx1 = float(x1) + vD.x * float(pc.IN_W);
+        float hy1 = float(y1) + vD.y * float(pc.IN_H);
+        onsA = hxA >= 0.0 && hxA <= float(pc.IN_W - 1u) && hyA >= 0.0 && hyA <= float(pc.IN_H - 1u);
+        onsB = hxB >= 0.0 && hxB <= float(pc.IN_W - 1u) && hyB >= 0.0 && hyB <= float(pc.IN_H - 1u);
+        onsC = hxC >= 0.0 && hxC <= float(pc.IN_W - 1u) && hyC >= 0.0 && hyC <= float(pc.IN_H - 1u);
+        onsD = hx1 >= 0.0 && hx1 <= float(pc.IN_W - 1u) && hy1 >= 0.0 && hy1 <= float(pc.IN_H - 1u);
+        if (onsA || onsB || onsC || onsD) {
+            float wxA[4], wyA[4], wxB[4], wyB[4], wxC[4], wyC[4], wxD[4], wyD[4];
+            gather_prep(hxA, hyA, wxA, wyA);
+            gather_prep(hxB, hyB, wxB, wyB);
+            gather_prep(hxC, hyC, wxC, wyC);
+            gather_prep(hx1, hy1, wxD, wyD);
+            int bx = int(floor(hxA)) - 1;
+            int by = int(floor(hyA)) - 1;
+            vec3 hA = vec3(0.0), hB = vec3(0.0), hC = vec3(0.0), hD = vec3(0.0);
+            float tA = 0.0, tB = 0.0, tC = 0.0, tD = 0.0;
+            for (int r = 0; r < 5; ++r) {
+                uint cy = uint(clamp(by + r, 0, int(pc.IN_H) - 1));
+                for (int c = 0; c < 5; ++c) {
+                    vec3 v = loadHistRaw(uint(clamp(bx + c, 0, int(pc.IN_W) - 1)), cy);
+                    if (r < 4 && c < 4 && onsA) { float w = wyA[r] * wxA[c]; tA += w; hA += v * w; }
+                    if (r < 4 && c > 0 && onsB) { float w = wyB[r] * wxB[c - 1]; tB += w; hB += v * w; }
+                    if (r > 0 && c < 4 && onsC) { float w = wyC[r - 1] * wxC[c]; tC += w; hC += v * w; }
+                    if (r > 0 && c > 0 && onsD) { float w = wyD[r - 1] * wxD[c - 1]; tD += w; hD += v * w; }
+                }
+            }
+            if (onsA) histA = max(hA / tA, vec3(0.0));
+            if (onsB) histB = max(hB / tB, vec3(0.0));
+            if (onsC) histC = max(hC / tC, vec3(0.0));
+            if (onsD) histD = max(hD / tD, vec3(0.0));
+        }
+    }
+
+    uint A0,A1,A2,A3, B0,B1,B2,B3, C0,C1,C2,C3, D0,D1,D2,D3;
+    feat_px(uvec2(x0, y0), vA, okA, onsA, histA, A0, A1, A2, A3);
+    feat_px(uvec2(x1, y0), vB, okB, onsB, histB, B0, B1, B2, B3);   // pre0's c10 = (x+1, y+0)
+    feat_px(uvec2(x0, y1), vC, okC, onsC, histC, C0, C1, C2, C3);   // pre0's c01 = (x+0, y+1)
+    feat_px(uvec2(x1, y1), vD, okD, onsD, histD, D0, D1, D2, D3);
+
+    vec2 c00[4], c10[4], c01[4], c11[4];
+    c00[0] = unpackHalf2x16(A0); c00[1] = unpackHalf2x16(A1);
+    c00[2] = unpackHalf2x16(A2); c00[3] = unpackHalf2x16(A3);
+    c10[0] = unpackHalf2x16(B0); c10[1] = unpackHalf2x16(B1);
+    c10[2] = unpackHalf2x16(B2); c10[3] = unpackHalf2x16(B3);
+    c01[0] = unpackHalf2x16(C0); c01[1] = unpackHalf2x16(C1);
+    c01[2] = unpackHalf2x16(C2); c01[3] = unpackHalf2x16(C3);
+    c11[0] = unpackHalf2x16(D0); c11[1] = unpackHalf2x16(D1);
+    c11[2] = unpackHalf2x16(D2); c11[3] = unpackHalf2x16(D3);
+
+    int q[16];
+    for (uint f = 0u; f < 16u; ++f) {
+        vec2 acc = vec2(0.0);
+        acc += w2(f, 0u, 0u, 0u) * c00[0] + w2(f, 0u, 0u, 1u) * c00[1]
+             + w2(f, 0u, 0u, 2u) * c00[2] + w2(f, 0u, 0u, 3u) * c00[3];
+        acc += w2(f, 1u, 0u, 0u) * c10[0] + w2(f, 1u, 0u, 1u) * c10[1]
+             + w2(f, 1u, 0u, 2u) * c10[2] + w2(f, 1u, 0u, 3u) * c10[3];
+        acc += w2(f, 0u, 1u, 0u) * c01[0] + w2(f, 0u, 1u, 1u) * c01[1]
+             + w2(f, 0u, 1u, 2u) * c01[2] + w2(f, 0u, 1u, 3u) * c01[3];
+        acc += w2(f, 1u, 1u, 0u) * c11[0] + w2(f, 1u, 1u, 1u) * c11[1]
+             + w2(f, 1u, 1u, 2u) * c11[2] + w2(f, 1u, 1u, 3u) * c11[3];
+        q[f] = quant1(acc.x + acc.y, biasAt(f));
+    }
+
+    uint base = (p.y * MODEL_W + p.x) * 4u;
+    outq[base + 0u] = pack4(q[0],  q[1],  q[2],  q[3]);
+    outq[base + 1u] = pack4(q[4],  q[5],  q[6],  q[7]);
+    outq[base + 2u] = pack4(q[8],  q[9],  q[10], q[11]);
+    outq[base + 3u] = pack4(q[12], q[13], q[14], q[15]);
+}

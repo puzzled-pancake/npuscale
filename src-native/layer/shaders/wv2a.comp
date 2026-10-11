@@ -1,0 +1,174 @@
+#version 450
+// W-V2a: Vulkan-compute port of phase2gpu/posta_egl.comp (R18-AA/R20/R26/R34d
+// production postA) — the CHAIN-CRITICAL half of post: npu decode, recurrent
+// quantize+store, anisotropic 3x3 gaussian (LDS tile), blend with
+// floor/black-guard/dist-decay, mu-law history write. Body VERBATIM except
+// GLES->Vulkan mechanics (RUNBOOK R26g):
+//   - uniforms -> push constants (shared 44B block with wv2b; postA uses
+//     jx/jy/bfloor/bftau/expo + dims)
+//   - NpuImg (rgba8 image2D binding 4) -> SSBO binding 4 word fetch + sbx:
+//     the R34d note proves UNORM fetch == k/255.0 exactly and
+//     roundEven(v*255)==k, so u8sx(imageLoad) === sbx(word, 8*c) — pure
+//     integer path, bit-identical, and the chassis stays image-free
+//   - u_recimg (rgba8 image2D binding 1) -> SSBO binding 1 u8 word: the
+//     store quantizes rec to floor(rec*255+0.5)/255 by construction, so
+//     writing that byte directly IS the same bits
+//   - mediump xd/yd/gw in fp32 (tolerance class, as W-V1)
+// Bindings (GLES numbers kept): 1 rec-out(u8 words), 4 npu-in(words),
+// 5 rawlr-in, 9 rpj-in, 10 hist-out(mu-law), 15 distd-in.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 15) readonly buffer DistD { uint distd[]; }; // compact dist (1 word/px)
+layout(std430, binding = 9) readonly buffer Repj { uint rpj[]; };   // fp16 RGBA rectified hist (MU-LAW)
+layout(std430, binding = 10) writeonly buffer Hist { uint hist[]; };// fp16 RGBA mu-law history
+layout(std430, binding = 5) readonly buffer RawLr { uint rawlr[]; };  // raw R11G11B10F
+layout(std430, binding = 4) readonly buffer NpuIn { uint npu[]; };   // s8 tensor words [1080][1920][2]
+layout(std430, binding = 1) writeonly buffer RecOut { uint recout[]; }; // u8 recurrent words (was u_recimg)
+
+layout(push_constant) uniform PC {   // shared with wv2b (one layout, one push)
+    float jx;      // +0
+    float jy;      // +4
+    float bfloor;  // +8   (u_params.w)
+    float bftau;   // +12
+    float expo;    // +16  (R26 bake)
+    uint OS_W;     // +20
+    uint OS_H;     // +24
+    uint LR_W;     // +28  GAME render width (ratio era; 640 at Performance)
+    uint LR_H;     // +32
+    float s_out;   // +36  per-tier NPU output dequant scale (was the const
+                   //      S_OUT below; the rcas layout's word here is
+                   //      'sharp' — SEPARATE pipelines, each reads its own)
+} pc;
+
+
+int sbx(uint w, uint sh) {
+    uint b = (w >> sh) & 0xffu;
+    return (b & 0x80u) != 0u ? int(b) - 256 : int(b);
+}
+vec3 loadRGB(uint w0, uint w1) {
+    return vec3(unpackHalf2x16(w0), unpackHalf2x16(w1).x);
+}
+vec3 loadRepj(uvec2 p) {
+    uint base = (p.y * pc.OS_W + p.x) * 2u;
+    return loadRGB(rpj[base], rpj[base + 1u]);
+}
+vec3 muled_raw(uint t) {
+    vec3 c = vec3(unpackHalf2x16((t & 0x7FFu) << 4u).x,
+                  unpackHalf2x16(((t >> 11) & 0x7FFu) << 4u).x,
+                  unpackHalf2x16(((t >> 22) & 0x3FFu) << 5u).x) * pc.expo;
+    vec3 m = max(vec3(0.1174) * log(1.0 + 150.0 * c), vec3(0.0));
+    vec2 xy = unpackHalf2x16(packHalf2x16(m.xy));
+    float z = unpackHalf2x16(packHalf2x16(vec2(m.z, 0.0))).x;
+    return vec3(xy, z);
+}
+shared uint s_lr[16 * 16 * 2];
+/* ratio era: 16x16 game-LR tile (was 8x8) — at inv_scale up to 1.0 (the
+ * Native/AA preset) an 8x8 IN workgroup spans 8 game rows and the 3x3
+ * gather needs up to ~11; 16 covers every preset with the -1 halo built
+ * into the anchor. At Performance the resolved texels are IDENTICAL to
+ * the old 8x8 tile (same anchor expression, same fills — index math only). */
+
+void main() {
+    vec2 jitter = vec2(pc.jx, pc.jy);
+    vec2 inv = vec2(pc.LR_W, pc.LR_H) / vec2(pc.OS_W, pc.OS_H);
+    vec2 scl = vec2(1.0) / inv;
+
+    ivec2 g8 = ivec2(gl_WorkGroupID.xy) * 8;
+    int bc = int(roundEven(-0.5 + inv.x * 0.5 + float(g8.x) * inv.x + jitter.x)) - 1;
+    int br = int(roundEven(-0.5 + inv.y * 0.5 + float(g8.y) * inv.y + jitter.y)) - 1;
+    for (uint i = gl_LocalInvocationIndex; i < 512u; i += 64u) {
+        uint t = i >> 1; uint w = i & 1u;
+        uint px = uint(clamp(bc + int(t & 15u), 0, int(pc.LR_W) - 1));
+        uint py = uint(clamp(br + int(t >> 4u), 0, int(pc.LR_H) - 1));
+        uint rt = rawlr[py * pc.LR_W + px];
+        vec3 c = vec3(unpackHalf2x16((rt & 0x7FFu) << 4u).x,
+                      unpackHalf2x16(((rt >> 11) & 0x7FFu) << 4u).x,
+                      unpackHalf2x16(((rt >> 22) & 0x3FFu) << 5u).x) * pc.expo;
+        vec3 m = max(vec3(0.1174) * log(1.0 + 150.0 * c), vec3(0.0));
+        s_lr[i] = (w == 0u) ? packHalf2x16(m.xy) : packHalf2x16(vec2(m.z, 1.0));
+    }
+    barrier();
+
+    uvec2 tid = gl_GlobalInvocationID.xy;
+    if (tid.x >= pc.OS_W || tid.y >= pc.OS_H) return;
+
+    /* R34d fetch — the 2 npu words ONCE (word order == the image texel bytes) */
+    uint w0 = npu[(tid.y * pc.OS_W * 2u) + tid.x * 2u];
+    uint w1 = npu[(tid.y * pc.OS_W * 2u) + tid.x * 2u + 1u];
+
+    float p0 = float(sbx(w0, 0u))  * pc.s_out;
+    float p1 = float(sbx(w0, 8u))  * pc.s_out;
+    float p2 = float(sbx(w0, 16u)) * pc.s_out;
+    float p3 = float(sbx(w0, 24u)) * pc.s_out;
+    vec4 rv = vec4(float(sbx(w1, 0u)), float(sbx(w1, 8u)),
+                   float(sbx(w1, 16u)), float(sbx(w1, 24u))) * pc.s_out;
+
+    vec4 rec = vec4(1.0) / (vec4(1.0) + exp2(-rv * 1.4426950409));
+    rec = floor(rec * 255.0 + 0.5) / 255.0;   // SDK recurrent is RGBA8
+    {   // was imageStore(u_recimg): the stored byte IS floor(rec*255+0.5)
+        uvec4 rb = uvec4(clamp(floor(rec * 255.0 + 0.5), vec4(0.0), vec4(255.0)));
+        recout[tid.y * pc.OS_W + tid.x] =
+            (rb.x & 0xffu) | ((rb.y & 0xffu) << 8u) | ((rb.z & 0xffu) << 16u) | ((rb.w & 0xffu) << 24u);
+    }
+
+    float correlation = (exp2(p0 * 1.4426950409) - exp2(-p0 * 1.4426950409)) / (exp2(p0 * 1.4426950409) + exp2(-p0 * 1.4426950409));
+    float sfx = 2.0 / (1.0 + exp2(-p1 * 1.4426950409));
+    float sfy = 2.0 / (1.0 + exp2(-p2 * 1.4426950409));
+    /* rev3c.14: the kernel override is RETIRED with the reset-signature
+     * rework — the disto.y bit is now wv1's own hysteresis latch only
+     * (band memory); nothing downstream consumes it. The kernel is stock
+     * for every pixel. */
+
+    vec2 lr_f = (vec2(-0.5) + inv * 0.5) + vec2(tid) * inv + jitter;
+    ivec2 lr_i = ivec2(roundEven(lr_f));
+
+    vec3 up = vec3(0.0);
+    float tw = 0.0;
+    for (int dy = 0; dy < 3; ++dy) {
+        float yd = (float(lr_i.y + dy - 1) - lr_f.y) * scl.y;
+        int ly = clamp(clamp(lr_i.y + dy - 1, 0, int(pc.LR_H) - 1) - br, 0, 15);
+        uint rowbase = uint(ly) * 16u * 2u;
+        for (int dx = 0; dx < 3; ++dx) {
+            float xd = (float(lr_i.x + dx - 1) - lr_f.x) * scl.x;
+            float gw = exp2((-0.5 / (0.47 * 0.47)) * 1.4426950409 *
+                           (xd * xd * sfx * sfx + 2.0 * correlation * (xd * yd) * sfx * sfy +
+                             yd * yd * sfy * sfy));
+            tw += gw;
+            int lx = clamp(clamp(lr_i.x + dx - 1, 0, int(pc.LR_W) - 1) - bc, 0, 15);
+            uint idx = rowbase + uint(lx) * 2u;
+            up += vec3(unpackHalf2x16(s_lr[idx]), unpackHalf2x16(s_lr[idx + 1u]).x) * gw;
+        }
+    }
+    up /= tw;
+
+    float blend = 1.0 / (1.0 + exp2(-p3 * 1.4426950409));
+    vec3 rp = loadRepj(tid);
+    float bfloor = pc.bfloor;
+    vec2 dd = unpackHalf2x16(distd[tid.y * pc.OS_W + tid.x]);
+    if (max(max(rp.r, rp.g), rp.b) <= 0.0) {
+        bfloor = 0.0;
+    } else if (pc.bftau > 0.0) {
+        bfloor *= clamp(1.0 - dd.x / pc.bftau, 0.0, 1.0);
+    }
+    blend = max(blend, bfloor);
+    /* geometric disocclusion bit (dd.y, set by wv1 THIS frame from the
+     * same-frame depth test at pixel vs reprojected position — the
+     * "nested black boxes" space-pan ghost, 2026-10-11). The model's
+     * blend channel is +2 frames stale (async NPU) and half-trusts
+     * history at freshly exposed pixels; AMD's same-frame model drives
+     * its own blend to rebuild there — emulate the result fresh, and
+     * since wv1 already zeroed rp for these pixels, blend=0 makes the
+     * output exactly the current-frame upsample. The photometric
+     * threshold clamp is RETIRED (false-fired on bright shimmer, missed
+     * dark ghosts). */
+    /* rev3c.13: the fired-pixel BLEND CLAMP is retired — the black-guard
+     * (rp==0 -> floor 0) plus the model's trained reset-signature response
+     * pace the rebuild; clamping overrode the model and de-accumulated the
+     * band (the crawl). The dd read stays for the kernel override above. */
+
+    vec3 model_color = up * (1.0 - blend) + rp * blend;
+
+    uint obase = (tid.y * pc.OS_W + tid.x) * 2u;
+    hist[obase]     = packHalf2x16(model_color.xy);
+    hist[obase + 1u] = packHalf2x16(vec2(model_color.z, 1.0));
+}

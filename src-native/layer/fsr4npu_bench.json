@@ -1,0 +1,17 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_fsr4npu_bench",
+        "type": "GLOBAL",
+        "library_path": "/var/home/armada/.local/share/vulkan/implicit_layer.d/fsr4npu_seam_bench.aarch64.so",
+        "api_version": "1.3.0",
+        "implementation_version": "3",
+        "description": "FSR4-NPU bench layer (xbench only; NMS-1 doorbell + NPU worker, rev3a; env FSR4NPU_BENCH gates loading so the game NEVER loads this copy; logs to ~/fsr4npu-logs)",
+        "enable_environment": {
+            "FSR4NPU_BENCH": "1"
+        },
+        "disable_environment": {
+            "FSR4NPU_BENCH_DISABLE": "1"
+        }
+    }
+}

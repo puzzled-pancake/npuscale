@@ -1,0 +1,75 @@
+LIBRARY libxess.dll
+EXPORTS
+    INTC_D3D11_XessCreateContext = libxess_real.INTC_D3D11_XessCreateContext
+    INTC_D3D11_XessDestroyContext = libxess_real.INTC_D3D11_XessDestroyContext
+    INTC_D3D11_XessExecute = libxess_real.INTC_D3D11_XessExecute
+    INTC_D3D11_XessForceLegacyScaleFactors = libxess_real.INTC_D3D11_XessForceLegacyScaleFactors
+    INTC_D3D11_XessGetExposureMultiplier = libxess_real.INTC_D3D11_XessGetExposureMultiplier
+    INTC_D3D11_XessGetInitParams = libxess_real.INTC_D3D11_XessGetInitParams
+    INTC_D3D11_XessGetInputResolution = libxess_real.INTC_D3D11_XessGetInputResolution
+    INTC_D3D11_XessGetIntelXeFXVersion = libxess_real.INTC_D3D11_XessGetIntelXeFXVersion
+    INTC_D3D11_XessGetJitterScale = libxess_real.INTC_D3D11_XessGetJitterScale
+    INTC_D3D11_XessGetOptimalInputResolution = libxess_real.INTC_D3D11_XessGetOptimalInputResolution
+    INTC_D3D11_XessGetProfilingData = libxess_real.INTC_D3D11_XessGetProfilingData
+    INTC_D3D11_XessGetVelocityScale = libxess_real.INTC_D3D11_XessGetVelocityScale
+    INTC_D3D11_XessGetVersion = libxess_real.INTC_D3D11_XessGetVersion
+    INTC_D3D11_XessInit = libxess_real.INTC_D3D11_XessInit
+    INTC_D3D11_XessIsOptimalDriver = libxess_real.INTC_D3D11_XessIsOptimalDriver
+    INTC_D3D11_XessSelectNetworkModel = libxess_real.INTC_D3D11_XessSelectNetworkModel
+    INTC_D3D11_XessSetExposureMultiplier = libxess_real.INTC_D3D11_XessSetExposureMultiplier
+    INTC_D3D11_XessSetJitterScale = libxess_real.INTC_D3D11_XessSetJitterScale
+    INTC_D3D11_XessSetLoggingCallback = libxess_real.INTC_D3D11_XessSetLoggingCallback
+    INTC_D3D11_XessSetVelocityScale = libxess_real.INTC_D3D11_XessSetVelocityScale
+    INTC_D3D12_GetApplicationInfo = libxess_real.INTC_D3D12_GetApplicationInfo
+    INTC_D3D12_GetGpuCrashDumpBufferInfo = libxess_real.INTC_D3D12_GetGpuCrashDumpBufferInfo
+    INTC_D3D12_GpuCrashDumpOnCommandListCreate = libxess_real.INTC_D3D12_GpuCrashDumpOnCommandListCreate
+    INTC_D3D12_GpuCrashDumpOnCommandListDestroy = libxess_real.INTC_D3D12_GpuCrashDumpOnCommandListDestroy
+    INTC_D3D12_GpuCrashDumpOnDeviceDestroy = libxess_real.INTC_D3D12_GpuCrashDumpOnDeviceDestroy
+    INTC_D3D12_RegisterDriverCallbacks = libxess_real.INTC_D3D12_RegisterDriverCallbacks
+    xessAILGetDecision = libxess_real.xessAILGetDecision
+    xessAILGetVersion = libxess_real.xessAILGetVersion
+    xessD3D12BuildPipelines = libxess_real.xessD3D12BuildPipelines
+    xessD3D12CreateContext = libxess_real.xessD3D12CreateContext
+    xessD3D12Execute = libxess_real.xessD3D12Execute
+    xessD3D12GetInitParams = libxess_real.xessD3D12GetInitParams
+    xessD3D12GetProfilingData = libxess_real.xessD3D12GetProfilingData
+    xessD3D12GetResourcesToDump = libxess_real.xessD3D12GetResourcesToDump
+    xessD3D12Init = libxess_real.xessD3D12Init
+    xessDestroyContext
+    xessForceLegacyScaleFactors
+    xessGetContextParameterP = libxess_real.xessGetContextParameterP
+    xessGetExposureMultiplier
+    xessGetInputResolution
+    xessGetIntelXeFXVersion
+    xessGetJitterScale
+    xessGetMaxResponsiveMaskValue
+    xessGetOptimalInputResolution
+    xessGetPipelineBuildStatus
+    xessGetProfilingData = libxess_real.xessGetProfilingData
+    xessGetProperties
+    xessGetVelocityScale
+    xessGetVersion
+    xessIsOptimalDriver
+    xessSelectNetworkModel
+    xessSetContextParameterF = libxess_real.xessSetContextParameterF
+    xessSetExposureMultiplier
+    xessSetJitterScale
+    xessSetLoggingCallback
+    xessSetMaxResponsiveMaskValue
+    xessSetVelocityScale
+    xessStartDump = libxess_real.xessStartDump
+    xessTrinityCreateContext = libxess_real.xessTrinityCreateContext
+    xessTrinityGetRequiredDeviceExtensions = libxess_real.xessTrinityGetRequiredDeviceExtensions
+    xessTrinityGetRequiredDeviceFeatures = libxess_real.xessTrinityGetRequiredDeviceFeatures
+    xessTrinityGetRequiredInstanceExtensions = libxess_real.xessTrinityGetRequiredInstanceExtensions
+    xessVKAILGetDecision = libxess_real.xessVKAILGetDecision
+    xessVKBuildPipelines
+    xessVKCreateContext
+    xessVKExecute
+    xessVKGetInitParams
+    xessVKGetProfilingData = libxess_real.xessVKGetProfilingData
+    xessVKGetRequiredDeviceExtensions
+    xessVKGetRequiredDeviceFeatures
+    xessVKGetRequiredInstanceExtensions
+    xessVKGetResourcesToDump = libxess_real.xessVKGetResourcesToDump
+    xessVKInit

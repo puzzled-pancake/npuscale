@@ -1,0 +1,17 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_fsr4npu_seam",
+        "type": "GLOBAL",
+        "library_path": "/var/home/armada/.local/share/vulkan/implicit_layer.d/fsr4npu_seam.aarch64.so",
+        "api_version": "1.3.0",
+        "implementation_version": "2",
+        "description": "FSR4-NPU full seam layer (Armada OS; R59 lineage minimal_seam+seam+qnn_glue, mask=3 HTP vote, NMS.exe gate; logs to ~/fsr4npu-logs)",
+        "enable_environment": {
+            "ENABLE_FSR4NPU_SEAM": "1"
+        },
+        "disable_environment": {
+            "DISABLE_FSR4NPU_SEAM": "1"
+        }
+    }
+}
